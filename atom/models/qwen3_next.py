@@ -34,6 +34,7 @@ from atom.model_ops.split_chunk import (
     fused_split_chunk_qwen_next_qkvzba,
 )
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.triton_mrope import try_mrope_qk_fused
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -58,6 +59,7 @@ ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
+
 
 
 def mamba_v2_sharded_weight_loader(
@@ -430,7 +432,19 @@ class Qwen3NextAttention(nn.Module):
             )
         else:
             q, k = self.qk_norm(q, k)
-            q, k = self.rotary_emb(positions, q, k)
+            fused_qk = try_mrope_qk_fused(
+                self.rotary_emb,
+                positions,
+                q,
+                k,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            if fused_qk is None:
+                q, k = self.rotary_emb(positions, q, k)
+            else:
+                q, k = fused_qk
             attn_output = self.attn(q, k, v)
 
         if self.use_fused_sigmoid_mul_quant:
