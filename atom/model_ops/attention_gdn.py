@@ -15,6 +15,7 @@ from atom.model_ops.fla_ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
+from atom.model_ops.fla_ops.gdn_decode_fast import gdn_decode_update_fast
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -241,6 +242,7 @@ class GatedDeltaNet(nn.Module):
             value_spec = value_spec.view(1, num_tokens_spec, -1, self.head_v_dim)
 
         # 1.2: Process the remaining part
+        # assert 0,f"{gdn_metadata.num_prefills=},{gdn_metadata.num_decodes=}"
         if gdn_metadata.num_prefills > 0:
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
@@ -366,19 +368,22 @@ class GatedDeltaNet(nn.Module):
             )
         elif gdn_metadata.num_decodes > 0:
             if use_sglang_fused_decode:
-                core_attn_out_non_spec = sglang_fused_sigmoid_gating_delta_rule_update(
+                core_attn_out_non_spec = gdn_decode_update_fast(
                     A_log=self.A_log,
                     a=a,
+                    b=b,
                     dt_bias=self.dt_bias,
-                    softplus_beta=1.0,
-                    softplus_threshold=20.0,
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    b=b,
-                    initial_state_source=ssm_state,
-                    initial_state_indices=non_spec_state_indices_tensor,
-                    cu_seqlens=non_spec_query_start_loc[: gdn_metadata.num_decodes + 1],
+                    beta=1.0,
+                    threshold=20.0,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[
+                        : gdn_metadata.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
                 last_recurrent_state = None
