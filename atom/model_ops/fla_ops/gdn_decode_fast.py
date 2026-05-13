@@ -46,21 +46,41 @@ def _gdn_decode_update_kernel(
 
     state_base = ((state_idx * HV + i_hv) * K) * V
     state_offsets = state_base + o_k[:, None] * V + o_v[None, :]
-    h = tl.load(state + state_offsets, mask=mask_h, other=0.0).to(tl.float32)
+    h = tl.load(
+        state + state_offsets,
+        mask=mask_h,
+        other=0.0,
+        cache_modifier=".cg",
+    ).to(tl.float32)
 
     q_offsets = (i_n * H + i_h) * K + o_k
     k_offsets = (i_n * H + i_h) * K + o_k
     v_offsets = (i_n * HV + i_hv) * V + o_v
-    q_vec = tl.load(q + q_offsets, mask=mask_k, other=0.0).to(tl.float32)
-    k_vec = tl.load(k + k_offsets, mask=mask_k, other=0.0).to(tl.float32)
-    v_vec = tl.load(v + v_offsets, mask=mask_v, other=0.0).to(tl.float32)
+    q_vec = tl.load(
+        q + q_offsets,
+        mask=mask_k,
+        other=0.0,
+        cache_modifier=".ca",
+    ).to(tl.float32)
+    k_vec = tl.load(
+        k + k_offsets,
+        mask=mask_k,
+        other=0.0,
+        cache_modifier=".ca",
+    ).to(tl.float32)
+    v_vec = tl.load(
+        v + v_offsets,
+        mask=mask_v,
+        other=0.0,
+        cache_modifier=".ca",
+    ).to(tl.float32)
 
     x = tl.load(a + i_n * HV + i_hv).to(tl.float32) + tl.load(
         dt_bias + i_hv
     ).to(tl.float32)
     softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
     gate = -tl.exp(tl.load(A_log + i_hv).to(tl.float32)) * softplus_x
-    beta = 1.0 / (1.0 + tl.exp(-tl.load(b + i_n * HV + i_hv).to(tl.float32)))
+    beta = tl.sigmoid(tl.load(b + i_n * HV + i_hv).to(tl.float32))
 
     q_vec = q_vec * tl.rsqrt(tl.sum(q_vec * q_vec, axis=0) + 1.0e-6)
     k_vec = k_vec * tl.rsqrt(tl.sum(k_vec * k_vec, axis=0) + 1.0e-6)
@@ -73,7 +93,12 @@ def _gdn_decode_update_kernel(
 
     out_offsets = (i_n * HV + i_hv) * V + o_v
     tl.store(out + out_offsets, out_vec.to(out.dtype.element_ty), mask=mask_v)
-    tl.store(state + state_offsets, h.to(state.dtype.element_ty), mask=mask_h)
+    tl.store(
+        state + state_offsets,
+        h.to(state.dtype.element_ty),
+        mask=mask_h,
+        cache_modifier=".cg",
+    )
 
 
 @triton.jit
