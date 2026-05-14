@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import importlib
-
 import torch
 import triton
 import triton.language as tl
@@ -21,12 +19,10 @@ from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 from aiter.dist.parallel_state import get_tp_group
 
-try:
-    sglang_fused_sigmoid_gating_delta_rule_update = importlib.import_module(
-        "sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent"
-    ).fused_sigmoid_gating_delta_rule_update
-except ImportError:
-    sglang_fused_sigmoid_gating_delta_rule_update = None
+# Do not select SGLang's fused decode kernel by import side effect. Its state/cache
+# layout contract is owned by upstream SGLang and is not compatible with ATOM's
+# GDN forward context for Qwen3.5.
+sglang_fused_sigmoid_gating_delta_rule_update = None
 
 
 @triton.jit
