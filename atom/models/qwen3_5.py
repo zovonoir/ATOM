@@ -259,12 +259,21 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             qkvzba = self.in_proj_qkvzba(hidden_states)
             k_heads_after_tp = self.num_k_heads // self.tp_size
             v_heads_after_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros_qwen3_5_qkvzba(
-                qkvzba,
-                k_heads_after_tp,
-                v_heads_after_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+            qkv_size = 2 * k_heads_after_tp * self.head_k_dim + v_heads_after_tp * self.head_v_dim
+            z_size = v_heads_after_tp * self.head_v_dim
+            N = qkvzba.size(0)
+            mixed_qkv = qkvzba[:, :qkv_size].contiguous()
+            # .contiguous() before view: column-slice is non-contiguous, and the
+            # downstream aiter gated_rmsnorm_fp8_group_quant kernel reads z via
+            # raw pointers assuming contiguous layout.
+            z = qkvzba[:, qkv_size:qkv_size + z_size].contiguous().view(
+                N, v_heads_after_tp, self.head_v_dim
+            )
+            ba_v = qkvzba[:, qkv_size + z_size:]
+            b = ba_v[:, :v_heads_after_tp].contiguous()
+            a = ba_v[:, v_heads_after_tp:].contiguous()
+            core_attn_out = torch.zeros(
+                N, v_heads_after_tp, self.head_v_dim, dtype=qkvzba.dtype, device=qkvzba.device
             )
         else:
             if x_fp8 is not None:
@@ -277,8 +286,15 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             z_size = self.value_dim // self.tp_size
             num_v_heads_tp = self.num_v_heads // self.tp_size
 
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros(
-                mixed_qkvz, ba, qkv_size, z_size, self.head_v_dim, num_v_heads_tp
+            N = mixed_qkvz.size(0)
+            mixed_qkv = mixed_qkvz[:, :qkv_size].contiguous()
+            z = mixed_qkvz[:, qkv_size:qkv_size + z_size].contiguous().view(
+                N, num_v_heads_tp, self.head_v_dim
+            )
+            b = ba[:, :num_v_heads_tp].contiguous()
+            a = ba[:, num_v_heads_tp:].contiguous()
+            core_attn_out = torch.zeros(
+                N, num_v_heads_tp, self.head_v_dim, dtype=mixed_qkvz.dtype, device=mixed_qkvz.device
             )
 
         # ============================================================
