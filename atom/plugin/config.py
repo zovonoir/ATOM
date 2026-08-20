@@ -369,12 +369,10 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from sglang.srt.configs.modelopt_config import ModelOptConfig
     from sglang.srt.distributed import get_tensor_model_parallel_rank
-    from sglang.srt.layers.dp_attention import (
-        get_attention_cp_rank,
-        get_attention_cp_size,
-        get_attention_tp_rank,
-        get_attention_tp_size,
-    )
+    # The free functions these replace (dp_attention.get_attention_{cp,tp}_*)
+    # were removed in SGLang v0.5.17. `get_parallel()` carries the same values
+    # and exists in both v0.5.15 and v0.5.17, so this needs no version branch.
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
         PortArgs,
@@ -407,7 +405,17 @@ def _generate_atom_config_from_sglang_config(config: Any):
     online_quant_config = sglang_model_loader_extra_config.pop(
         "online_quant_config", None
     )
-    server_args.model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
+    # `online_quant_config` is ATOM's private key; strip it so SGLang's
+    # ModelConfig never sees it. SGLang v0.5.17 froze server_args after
+    # resolution and routes post-resolution writes through override(), which
+    # records provenance; v0.5.15 has no such method and takes the assignment.
+    _extra_config_json = json.dumps(sglang_model_loader_extra_config)
+    if hasattr(server_args, "override"):
+        server_args.override(
+            "atom.plugin.config", model_loader_extra_config=_extra_config_json
+        )
+    else:
+        server_args.model_loader_extra_config = _extra_config_json
     hf_overrides = json.loads(
         getattr(server_args, "json_model_override_args", None) or "{}"
     )
@@ -437,10 +445,11 @@ def _generate_atom_config_from_sglang_config(config: Any):
     rank = torch.distributed.get_rank()
 
     tp_rank = get_tensor_model_parallel_rank()
-    attn_cp_size = get_attention_cp_size()
-    attn_cp_rank = get_attention_cp_rank()
-    attn_tp_size = get_attention_tp_size()
-    attn_tp_rank = get_attention_tp_rank()
+    parallel = get_parallel()
+    attn_cp_size = parallel.attn_cp_size
+    attn_cp_rank = parallel.attn_cp_rank
+    attn_tp_size = parallel.attn_tp_size
+    attn_tp_rank = parallel.attn_tp_rank
     enable_prefill_cp, prefill_cp_mode = _get_sglang_prefill_cp_config(server_args)
     (
         atom_tensor_parallel_size,

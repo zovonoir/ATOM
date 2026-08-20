@@ -232,9 +232,13 @@ def install_minimax_m3_pool_patch() -> None:
 
     def _local_kv_heads(runner) -> int:
         try:
-            from sglang.srt.layers.dp_attention import get_attention_tp_size
+            # dp_attention.get_attention_tp_size was removed in SGLang v0.5.17;
+            # get_parallel() carries the same value on v0.5.15 and v0.5.17 alike.
+            from sglang.srt.runtime_context import get_parallel
 
-            return int(runner.model_config.get_num_kv_heads(get_attention_tp_size()))
+            return int(
+                runner.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            )
         except Exception:
             hf_config = _text_config(runner.model_config.hf_config)
             tp_size = max(1, int(getattr(runner, "tp_size", 1)))

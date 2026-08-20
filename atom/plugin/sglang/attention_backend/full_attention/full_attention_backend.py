@@ -17,7 +17,7 @@ import sglang.srt.layers.attention.aiter_backend as _sglang_aiter
 import torch
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-from sglang.srt.layers.attention.utils import (
+from atom.plugin.sglang.sgl_compat import (
     create_flashinfer_kv_indices_triton,
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
