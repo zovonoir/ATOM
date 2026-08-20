@@ -64,6 +64,11 @@ per_token_group_quant_mla_deep_gemm_masked_fp8 = _resolve(
     "sglang.kernels.ops.quantization.fp8_kernel",
     _FP8_KERNEL_V0515,
 )
+track_mamba_states_if_needed = _resolve(
+    "track_mamba_states_if_needed",
+    "sglang.kernels.ops.mamba.mamba_state_scatter_triton",
+    "sglang.srt.layers.attention.mamba.mamba_state_scatter_triton",
+)
 
 __all__ = [
     "concat_and_cast_mha_k_triton",
@@ -72,4 +77,5 @@ __all__ = [
     "pad_sequence_with_mask",
     "per_tensor_quant_mla_fp8",
     "per_token_group_quant_mla_deep_gemm_masked_fp8",
+    "track_mamba_states_if_needed",
 ]
