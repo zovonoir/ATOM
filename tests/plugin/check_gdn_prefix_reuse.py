@@ -22,7 +22,7 @@ At temperature 0 the two P+S2 answers must be identical. Prefix lengths are
 chosen to land both on and off a 64-token chunk boundary, since the snapshot
 source differs between the two (`final_state` vs an interior `h` row).
 
-Usage: check_gdn_prefix_reuse.py [--port 31000] [--prefix-tokens 2048 2080]
+Usage: check_gdn_prefix_reuse.py [--port 31000] [--prefix-tokens 2048 2080] [--multiturn]
 """
 
 import argparse
@@ -76,6 +76,65 @@ def build_prefix(approx_tokens):
     return " ".join(words)
 
 
+def chat(messages, port, max_tokens=96):
+    out = post(
+        "/v1/chat/completions",
+        {
+            "model": "/model/Qwen3.5-397B-A17B-FP8",
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            # Thinking off: with it on the model spends the whole budget in
+            # `reasoning_content` and returns empty `content`, so the assistant
+            # turn would carry no generated tokens and the second turn would
+            # have nothing decode-side to reuse.
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        port=port,
+    )
+    return out["choices"][0]["message"]["content"]
+
+
+def check_multiturn(port, turn1_tokens=512):
+    """Reuse *generated* tokens as a prefix -- the decode-side snapshot path.
+
+    The prompt-prefix checks never exercise it: they only reuse the prompt,
+    whose state was snapshotted during prefill. A snapshot taken while decoding
+    only matters once a request's own output becomes someone else's prefix,
+    which is what the second turn of a conversation does. Driven through the
+    chat endpoint so the turns are templated the way a real deployment sends
+    them -- raw string concatenation instead makes the model see a finished
+    answer and emit EOS immediately, which tests nothing.
+
+    `turn1_tokens` is set above `mamba_track_interval` (256) so turn 1's
+    generation crosses at least one track boundary.
+    """
+    prompt = build_prefix(1024) + (
+        "\n\nList every item above with its value, one per line, no commentary."
+    )
+
+    post("/flush_cache", {}, port=port)
+    answer = chat([{"role": "user", "content": prompt}], port, max_tokens=turn1_tokens)
+
+    followup = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": answer},
+        {"role": "user", "content": "Which of the items you just listed has the largest value?"},
+    ]
+    warm = chat(followup, port)  # prefix hit spans turn 1's generated tokens
+
+    post("/flush_cache", {}, port=port)
+    cold = chat(followup, port)
+
+    ok = warm == cold and bool(cold)
+    label = f"multi-turn (turn 1 generated {len(answer)} chars)"
+    print(f"[{'PASS' if ok else 'FAIL'}] {label}")
+    if not ok:
+        print(f"    warm (cache hit): {warm[:200]!r}")
+        print(f"    cold (no cache) : {cold[:200]!r}")
+    return not ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=PORT)
@@ -85,6 +144,11 @@ def main():
         nargs="+",
         default=[2048, 2080],
         help="approx prefix lengths; include one that is not a multiple of 64",
+    )
+    ap.add_argument(
+        "--multiturn",
+        action="store_true",
+        help="also reuse generated tokens as a prefix (decode-side snapshot)",
     )
     args = ap.parse_args()
 
@@ -109,7 +173,10 @@ def main():
             print(f"    warm (cache hit): {warm[:220]!r}")
             print(f"    cold (no cache) : {cold[:220]!r}")
 
-    print("\nRESULT:", "all prefixes match" if not failures else f"{failures} mismatch")
+    if args.multiturn:
+        failures += check_multiturn(args.port)
+
+    print("\nRESULT:", "all checks match" if not failures else f"{failures} mismatch")
     return 1 if failures else 0
 
 
