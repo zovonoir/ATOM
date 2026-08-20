@@ -101,7 +101,10 @@ def chunk_gated_delta_rule_fwd(
         o=o,
     )
     if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
+        # `h` is always materialized above, so returning it costs nothing. The
+        # mamba radix cache's extra_buffer strategy snapshots it at chunk
+        # boundaries; `w`/`v_new` stay suppressed since only recompute needs them.
+        return g, o, A, final_state, None, h, None
     elif SUPPRESS_LEVEL >= 3:
         return g, o, A, final_state, w, h, v_new
 
@@ -149,7 +152,12 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         # the literal returned tensor (preserves the inplace contract).
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
-        return o, final_state
+        # `h` holds the per-chunk recurrent states, laid out as
+        # [B, NT, H, K, V] with NT indexed by prepare_chunk_offsets(cu_seqlens,
+        # 64); the extra_buffer prefix cache reads it to snapshot state at
+        # chunk boundaries. Inference-only path (no backward), so the extra
+        # output cannot perturb autograd.
+        return o, final_state, h
 
 
 @torch.compiler.disable
@@ -166,6 +174,7 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     o: torch.Tensor | None = None,
+    return_intermediate_states: bool = False,
 ):
     r"""
     Args:
@@ -200,6 +209,14 @@ def chunk_gated_delta_rule(
             Outputs of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
         final_state (torch.Tensor):
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+        intermediate_states (torch.Tensor):
+            Only returned when `return_intermediate_states=True`. Per-chunk
+            recurrent states of shape `[B, NT, H, K, V]`, where `intermediate_states[b, j]`
+            is the state *entering* chunk `j` (i.e. after `j` complete chunks of
+            64 tokens). With `cu_seqlens`, sequence `i` owns rows
+            `[prepare_chunk_offsets(cu_seqlens, 64)[i], ...[i + 1])`. Used by the
+            mamba radix cache's `extra_buffer` strategy to snapshot state at
+            chunk boundaries.
 
     Examples::
         >>> import torch
@@ -296,7 +313,7 @@ def chunk_gated_delta_rule(
         assert (
             o.is_contiguous()
         ), "chunk_gated_delta_rule: caller-provided o must be contiguous"
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
+    o, final_state, intermediate_states = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
         v,
@@ -311,4 +328,6 @@ def chunk_gated_delta_rule(
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
+    if return_intermediate_states:
+        return o, final_state, intermediate_states
     return o, final_state
