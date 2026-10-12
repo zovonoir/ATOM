@@ -266,3 +266,52 @@ def test_dflash_setter_keeps_outer_wrapper_shifted_points():
         adapter.set_dflash_layers_to_capture([2, 10, 18, 26, 34, 42, 50, 58])
 
     assert adapter.dflash_capture_points == (2, 10, 18, 26, 34, 42, 50, 58)
+
+
+def _runtime_contract():
+    with patch.dict(sys.modules, _make_fake_modules()):
+        sys.modules.pop("atom.plugin.sglang.models.qwen3_5", None)
+        module = importlib.import_module("atom.plugin.sglang.models.qwen3_5")
+    return module._validate_qwen35_runtime_contract
+
+
+def _server_args(**overrides):
+    fields = {
+        "disable_radix_cache": False,
+        "mamba_radix_cache_strategy": "extra_buffer",
+        "page_size": 64,
+        "speculative_algorithm": None,
+        "attention_backend": "aiter",
+        "decode_attention_backend": None,
+        "prefill_attention_backend": None,
+    }
+    fields.update(overrides)
+    return _Obj(**fields)
+
+
+@pytest.mark.parametrize("page_size", [1, 32, 128, 256, None])
+def test_runtime_contract_rejects_extra_buffer_off_page_64(page_size):
+    validate = _runtime_contract()
+    with pytest.raises(ValueError, match="requires --page-size 64"):
+        validate(_server_args(page_size=page_size))
+
+
+def test_runtime_contract_page_size_only_matters_with_extra_buffer_on():
+    validate = _runtime_contract()
+    validate(_server_args())
+    validate(_server_args(page_size=128, disable_radix_cache=True))
+    validate(_server_args(page_size=128, mamba_radix_cache_strategy="no_buffer"))
+
+
+def test_runtime_contract_dflash_aiter_requires_unified_attention():
+    validate = _runtime_contract()
+    args = _server_args(speculative_algorithm="DFLASH")
+    with pytest.raises(ValueError, match="SGLANG_USE_AITER_UNIFIED_ATTN=1"):
+        validate(args, unified_attn_enabled=False)
+    validate(args, unified_attn_enabled=True)
+    # Neither half of the condition alone triggers it.
+    validate(_server_args(speculative_algorithm="EAGLE"), unified_attn_enabled=False)
+    validate(
+        _server_args(speculative_algorithm="DFLASH", attention_backend="triton"),
+        unified_attn_enabled=False,
+    )
