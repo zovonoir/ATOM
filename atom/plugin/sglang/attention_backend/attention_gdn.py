@@ -174,6 +174,94 @@ def _flydsl_prefill_metadata(
 class SGLangGatedDeltaNet(GatedDeltaNet):
     """Run batched ATOM GDN while filling SGLang's verify snapshots."""
 
+    # --- mamba radix cache (extra_buffer) state tracking ------------------
+    #
+    # SGLang's HybridLinearAttnBackend still owns the prefix cache and still
+    # computes the track metadata (`_init_track_ssm_indices` runs from its
+    # `init_forward_metadata` regardless of who does the GDN math), but the
+    # plugin replaces the GDN compute wholesale and so never reaches the
+    # snapshot calls SGLang makes right after its own mixer. These overrides
+    # put them back, driving SGLang's own helpers so the snapshot semantics
+    # stay defined in one place.
+
+    def _sglang_track_context(self):
+        """(linear backend, its forward metadata) when tracking is on."""
+        from atom.plugin.sglang.runtime import get_current_forward_batch
+
+        forward_batch = get_current_forward_batch()
+        if forward_batch is None:
+            return None, None
+        if getattr(forward_batch, "mamba_track_mask", None) is None:
+            return None, None
+
+        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
+        if attn_backend is None:
+            return None, None
+        linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+        metadata = getattr(linear_backend, "forward_metadata", None)
+        if metadata is None:
+            return None, None
+        return linear_backend, metadata
+
+    def wants_prefill_states(self) -> bool:
+        _, metadata = self._sglang_track_context()
+        return bool(getattr(metadata, "has_mamba_track_mask", False))
+
+    def track_prefill_states(self, intermediate_states, ssm_state) -> None:
+        linear_backend, metadata = self._sglang_track_context()
+        if linear_backend is None:
+            return
+        if not getattr(metadata, "has_mamba_track_mask", False):
+            return
+        from atom.plugin.sglang.runtime import get_current_forward_batch
+
+        # SGLang squeezes a leading batch axis off `h` before indexing chunk
+        # rows with `track_ssm_h_src`; pin that axis so the indexing never
+        # depends on which prefill kernel (Triton or FlyDSL) produced `h`.
+        h = intermediate_states.reshape(1, -1, *intermediate_states.shape[-3:])
+        linear_backend._track_mamba_state_extend(
+            get_current_forward_batch(), h, ssm_state, metadata
+        )
+
+    def track_prefill_conv_states(self, mixed_qkv_t, conv_state) -> None:
+        from atom.plugin.sglang.runtime import get_current_forward_batch
+
+        linear_backend, metadata = self._sglang_track_context()
+        if linear_backend is None:
+            return
+        if not getattr(metadata, "has_mamba_track_mask", False):
+            return
+        track_conv_indices = getattr(metadata, "track_conv_indices", None)
+        if track_conv_indices is None or track_conv_indices.numel() == 0:
+            return
+
+        # SGLang caches the destination slots on the GDN backend, but only on
+        # the backend classes that reach their own conv call site. Derive them
+        # when absent -- it is the same one-liner SGLang uses.
+        dst = getattr(metadata, "conv_states_mask_indices", None)
+        if dst is None:
+            forward_batch = get_current_forward_batch()
+            mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            dst = metadata.mamba_track_indices[mask_indices]
+
+        # mixed_qkv_t is [dim, tokens]; track_conv_indices is
+        # [tracked_rows, conv_state_len], so the gather gives
+        # [dim, tracked_rows, conv_state_len] and the transpose lands it on the
+        # pool's [slot, conv_dim, state_len].
+        conv_state[dst] = mixed_qkv_t[:, track_conv_indices].transpose(0, 1)
+
+    def track_decode_states(self, conv_state, ssm_state, state_indices) -> None:
+        from atom.plugin.sglang.runtime import get_current_forward_batch
+
+        linear_backend, _ = self._sglang_track_context()
+        if linear_backend is None:
+            return
+        # `state_indices` is the decode slot vector the step just wrote, one
+        # row per request, which is what SGLang passes as `cache_indices`.
+        linear_backend._track_mamba_state_decode(
+            get_current_forward_batch(), conv_state, ssm_state, state_indices
+        )
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,

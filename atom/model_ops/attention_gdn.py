@@ -157,6 +157,54 @@ class GatedDeltaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    # --- prefix-cache state tracking -------------------------------------
+    #
+    # A hybrid GDN model's prefix cache has to store a recurrent state
+    # alongside the KV pages, and unlike KV that state is a snapshot valid at
+    # exactly one sequence position. Serving frameworks that support it ask for
+    # a snapshot at fixed boundaries so a cached prefix can be resumed. The
+    # boundary bookkeeping is the framework's (it owns the cache), so these
+    # hooks stay no-ops here and the plugin that has a prefix cache overrides
+    # them. Anything without one pays nothing.
+
+    def wants_prefill_states(self) -> bool:
+        """Whether this prefill should keep `h` for `track_prefill_states`.
+
+        `h` is computed either way but is dropped on return unless asked for,
+        since holding it raises the allocator high-water mark for every
+        prefill that has nowhere to put it.
+        """
+        return False
+
+    def track_prefill_states(self, intermediate_states, ssm_state) -> None:
+        """Per-chunk states from the prefill kernel, for boundary snapshots.
+
+        `intermediate_states` holds `NT` states of shape `[H, K, V]` in the
+        same layout as the final state written to `ssm_state`; row `j` is the
+        state entering chunk `j`, with `NT` indexed by
+        `prepare_chunk_offsets(cu_seqlens, 64)`. Called only when
+        `wants_prefill_states()` is true, after the final state has been
+        written back to `ssm_state`.
+
+        This is only half of a resumable snapshot: GDN also carries a causal
+        conv whose sliding window has to be captured at the same boundary, via
+        `track_prefill_conv_states`. Restoring one without the other leaves the
+        first `kernel_size - 1` resumed tokens reading the wrong conv history.
+        """
+
+    def track_prefill_conv_states(self, mixed_qkv_t, conv_state) -> None:
+        """Conv input window at the boundary, the other half of the snapshot.
+
+        `mixed_qkv_t` is the pre-conv input as `[dim, tokens]`. The window is
+        taken from the *input* rather than from `conv_state` because
+        `conv_state` only ever holds the window at the end of the forward, not
+        at an interior boundary. Called before the conv, which overwrites
+        `conv_state` in place.
+        """
+
+    def track_decode_states(self, conv_state, ssm_state, state_indices) -> None:
+        """Post-step conv/SSM state, for rows the framework wants snapshotted."""
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -278,6 +326,9 @@ class GatedDeltaNet(nn.Module):
         # 1.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+            # Must run before causal_conv1d_fn: the snapshot is of the conv
+            # input window, and the call below overwrites conv_state in place.
+            self.track_prefill_conv_states(mixed_qkv_non_spec_T, conv_state)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
             query_non_spec, key_non_spec, value_non_spec = causal_conv1d_fn(
@@ -427,6 +478,11 @@ class GatedDeltaNet(nn.Module):
         # 2.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
+            # `h` is large and is dropped on return unless something will read
+            # it: ATOM's own state cache (`ckpt`) or a framework prefix cache
+            # that asked for boundary snapshots.
+            track_prefill = self.wants_prefill_states()
+            keep_h = ckpt is not None or track_prefill
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
             use_flydsl_prefill = False
             if (
@@ -457,7 +513,7 @@ class GatedDeltaNet(nn.Module):
                     ssm_state,
                     non_spec_query_start_loc,
                     flydsl_metadata,
-                    keep_intermediate_states=ckpt is not None,
+                    keep_intermediate_states=keep_h,
                     state_indices=non_spec_state_indices_in_tensor,
                     has_initial_state=has_initial_state,
                 )
@@ -475,14 +531,19 @@ class GatedDeltaNet(nn.Module):
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
-                    # Only when there is somewhere to put them; `h` is large and is
-                    # dropped on return otherwise.
-                    keep_intermediate_states=ckpt is not None,
+                    keep_intermediate_states=keep_h,
                 )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            h = None
+            if keep_h:
+                from atom.model_ops.fla_ops.chunk import pop_last_intermediate_states
+
+                # Popped once: the state cache and the prefix-cache hook below
+                # read the same tensor.
+                h = flydsl_h if use_flydsl_prefill else pop_last_intermediate_states()
             # SSM state cache: copy out every checkpoint this step reached.
             #
             # A checkpoint slot is never where the recurrence runs — the live
@@ -502,15 +563,11 @@ class GatedDeltaNet(nn.Module):
             # `state_len` rows of the conv input ending at the position, the
             # same bytes that kernel's end-of-sequence store writes.
             if ckpt is not None:
-                from atom.model_ops.fla_ops.chunk import (
-                    CHUNK_SIZE,
-                    pop_last_intermediate_states,
-                )
+                from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
                 from atom.model_ops.fla_ops.state_checkpoint import (
                     write_state_checkpoints,
                 )
 
-                h = flydsl_h if use_flydsl_prefill else pop_last_intermediate_states()
                 if h is not None:
                     # One launch for both halves. `conv_state` is
                     # [slot, conv_dim, state_len] by here (see the transpose
@@ -530,6 +587,10 @@ class GatedDeltaNet(nn.Module):
                         non_spec_query_start_loc,
                         CHUNK_SIZE,
                     )
+            # Order matters: the final state must already be in the pool, since
+            # the chunk-aligned half of the snapshot is a pool-to-pool copy.
+            if track_prefill and h is not None:
+                self.track_prefill_states(h, ssm_state)
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes
             core_attn_out_non_spec = replayssm_gated_delta_rule(
@@ -608,6 +669,9 @@ class GatedDeltaNet(nn.Module):
                         use_qk_l2norm_in_kernel=True,
                     )
                 )
+            self.track_decode_states(
+                conv_state, ssm_state, non_spec_state_indices_tensor
+            )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
