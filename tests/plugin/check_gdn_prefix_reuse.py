@@ -9,41 +9,65 @@ The failure mode this guards against is silent. A hybrid GDN model's radix node
 carries both KV pages and a recurrent state snapshot; if the snapshot is stale
 or was never taken, a prefix hit resumes from the wrong state and the model
 keeps generating fluent-but-wrong text. Accuracy benchmarks blur that into
-noise, so compare byte-for-byte instead:
+noise, so each case compares a warm arm (resumed from a snapshot) against a
+cold arm (no prefix to hit) on the same token ids, by the teacher-forced
+log-probs of those tokens rather than by generated text:
 
-  warm: [flush] -> P+S1 (populates the tree) -> P+S2 (hits the P prefix)
-  cold: [flush] -> P+S2 (no prefix to hit)
+* Generated text is a poor oracle. Greedy decoding turns any numerical
+  difference into a different token at the first near-tie, and both arms
+  legitimately differ numerically: the warm arm prefills only the suffix, in
+  a different batch shape, and MoE targets (Qwen3.5-397B-A17B) are not even
+  run-to-run deterministic at temperature 0.
+* Log-probs are compared against a noise level measured on the same server,
+  so the verdict means the same thing on a deterministic 9B and on a
+  non-deterministic MoE.
 
-Two things make a byte-for-byte verdict trustworthy, and both are enforced here
-rather than left to the reader:
+There are two snapshot paths and each gets its own case:
 
-* **The warm arm must actually hit.** Without a hit the two arms are the same
-  computation and every case passes vacuously. Check the server log for a
-  non-zero `#cached-token` per warm request.
-* **The cold arm must be reproducible.** DFLASH is *not* byte-deterministic at
-  temperature 0, even with the radix cache disabled: speculative verify
-  computes logits in a different batch shape than plain decode, so a near-tie
-  can flip. A free-form prompt flips between "**9930**" and "9930" from run to
-  run. Every case therefore runs cold twice and reports INCONCLUSIVE, not FAIL,
-  when the two disagree -- that is the harness failing to measure, not the
-  cache failing. Prompts also demand a bare constrained answer, which is stable
-  under DFLASH (verified 6/6) where free-form phrasing is not.
+* **Prompt prefix** (prefill-side snapshot):
+
+    warm: [flush] -> P (populates the tree) -> P+S+T (hits the P prefix)
+    cold: [flush] -> P+S+T (twice; their gap is the noise level)
+
+  T is a 200-token greedy continuation, so the score covers generated-style
+  text and not just the question.
+
+* **Generated prefix** (decode-side snapshot, `--decode-snapshot`). A request's
+  own output becomes the next request's prefix, so the state at the hit was
+  produced by the recurrent *decode* kernel while the cold arm recomputes it
+  with the *prefill* kernel. The noise level therefore also includes that
+  kernel gap, measured without any cache: the first request's own decode
+  log-probs versus the cold prefill's. Token ids are passed verbatim so the
+  radix match cannot break on re-templating, and the output is free-form
+  prose -- a predictable list scores near-zero log-probs whatever the state.
+
+A verdict is only reported when it means something:
+
+* **The warm arm must actually hit**, and for the decode case hit past the
+  prompt with enough generated tokens left to score. Otherwise both arms are
+  the same computation; the case is reported VACUOUS.
+* **Anything not PASS exits non-zero.**
 
 Usage: check_gdn_prefix_reuse.py [--port 31000] [--prefix-tokens 2048 2080]
-                                 [--multiturn]
+                                 [--decode-snapshot]
 """
 
 import argparse
 import json
 import sys
+import time
 import urllib.request
 
 PORT = 31000
-MODEL = "/model/Qwen3.5-397B-A17B-FP8"
 
-# Constrained enough that a near-tie on formatting cannot flip it; see the
-# module docstring on why free-form answers are unusable under DFLASH.
-BARE = " Reply with only the numeric value: no words, no punctuation, no markdown."
+# Warm may exceed the measured noise level by this factor plus an absolute
+# slack (mean |dlogprob| over the scored tokens). The slack covers the
+# batch-shape gap between a suffix-only and a full prefill, which cold/cold
+# cannot see. Qwen3.5-397B-A17B-FP8 TP4, SGLang v0.5.20: correct snapshots
+# scored 0.006-0.017; a missing prefill-side snapshot 0.081-0.143; a missing
+# decode-side snapshot 0.156-0.438.
+NOISE_FACTOR = 2.0
+NOISE_SLACK = 0.03
 
 
 def post(path, payload=None, port=PORT, timeout=600):
@@ -62,35 +86,47 @@ def post(path, payload=None, port=PORT, timeout=600):
         return body
 
 
-def gen(prompt, port, max_new_tokens=32):
-    out = post(
-        "/generate",
-        {
-            "text": prompt,
-            "sampling_params": {"temperature": 0, "max_new_tokens": max_new_tokens},
-        },
-        port=port,
-    )
-    return out["text"]
+def flush(port):
+    # Right after startup, warmup requests can still be in flight and
+    # /flush_cache is refused; retry instead of treating that as an error.
+    for _ in range(60):
+        try:
+            post("/flush_cache", {}, port=port)
+            return
+        except Exception:  # noqa: BLE001
+            time.sleep(1)
+    raise RuntimeError("/flush_cache never succeeded")
 
 
-def chat(messages, port, max_tokens=32):
-    out = post(
-        "/v1/chat/completions",
-        {
-            "model": MODEL,
-            "messages": messages,
+def generate(port, ids, max_new_tokens=1, logprob_start=None):
+    payload = {
+        "input_ids": ids,
+        "sampling_params": {
             "temperature": 0,
-            "max_tokens": max_tokens,
-            # Thinking off: with it on the model spends the whole budget in
-            # `reasoning_content` and returns empty `content`, so the assistant
-            # turn would carry no generated tokens and the second turn would
-            # have nothing decode-side to reuse.
-            "chat_template_kwargs": {"enable_thinking": False},
+            "max_new_tokens": max_new_tokens,
+            "ignore_eos": True,
         },
-        port=port,
-    )
-    return out["choices"][0]["message"]["content"]
+    }
+    if logprob_start is not None:
+        payload.update(return_logprob=True, logprob_start_len=logprob_start)
+    return post("/generate", payload, port=port)
+
+
+def tokenize(text, port):
+    return post("/tokenize", {"prompt": text}, port=port)["tokens"]
+
+
+def cached(res):
+    return res["meta_info"].get("cached_tokens") or 0
+
+
+def input_logprobs(res, n):
+    """Log-probs of the `n` tokens after `logprob_start`."""
+    return [x[0] for x in res["meta_info"]["input_token_logprobs"]][1 : n + 1]
+
+
+def mean_gap(a, b):
+    return sum(abs(x - y) for x, y in zip(a, b, strict=True)) / len(a)
 
 
 def build_prefix(approx_tokens):
@@ -105,76 +141,119 @@ def build_prefix(approx_tokens):
     return " ".join(words)
 
 
-def verdict(label, warm, cold_a, cold_b):
-    """PASS / FAIL / INCONCLUSIVE, printed and returned."""
-    if cold_a != cold_b:
-        print(f"[INCONCLUSIVE] {label} -- cold arm is not reproducible")
-        print(f"    cold #1: {cold_a[:160]!r}")
-        print(f"    cold #2: {cold_b[:160]!r}")
-        return "inconclusive"
-    if warm == cold_a:
-        print(f"[PASS] {label}")
-        return "pass"
-    print(f"[FAIL] {label}")
-    print(f"    warm (cache hit): {warm[:160]!r}")
-    print(f"    cold (no cache) : {cold_a[:160]!r}")
-    return "fail"
+def report(status, label, *details):
+    print(f"[{status.upper()}] {label}")
+    for line in details:
+        print(f"    {line}")
+    return status
+
+
+def verdict(label, warm_gap, noise, stats):
+    if warm_gap <= NOISE_FACTOR * noise + NOISE_SLACK:
+        return report("pass", label, stats)
+    return report("fail", label, stats)
+
+
+def cold_pair(port, ids, start, n):
+    colds = []
+    for _ in range(2):
+        flush(port)
+        colds.append(input_logprobs(generate(port, ids, logprob_start=start), n))
+    return colds
 
 
 def check_prompt_prefix(port, approx):
     """Reuse a prompt prefix -- the prefill-side snapshot path."""
-    prefix = build_prefix(approx)
-    s1 = "\n\nHow many items are listed above?" + BARE
-    s2 = "\n\nWhat is the single largest recorded value above?" + BARE
-
-    post("/flush_cache", {}, port=port)
-    gen(prefix + s1, port)  # populate the tree with P
-    warm = gen(prefix + s2, port)  # should hit the P prefix
-
-    colds = []
-    for _ in range(2):
-        post("/flush_cache", {}, port=port)
-        colds.append(gen(prefix + s2, port))
-
-    return verdict(f"prompt prefix ~{approx} tokens", warm, *colds)
-
-
-def check_multiturn(port, turn1_tokens=512):
-    """Reuse *generated* tokens as a prefix -- the decode-side snapshot path.
-
-    The prompt-prefix checks never exercise it: they only reuse the prompt,
-    whose state was snapshotted during prefill. A snapshot taken while decoding
-    only matters once a request's own output becomes someone else's prefix,
-    which is what the second turn of a conversation does. Driven through the
-    chat endpoint so the turns are templated the way a real deployment sends
-    them -- raw string concatenation instead makes the model see a finished
-    answer and emit EOS immediately, which tests nothing.
-
-    `turn1_tokens` is above `mamba_track_interval` (256) so turn 1's generation
-    crosses at least one track boundary.
-    """
-    prompt = build_prefix(1024) + (
-        "\n\nList every item above with its value, one per line, no commentary."
+    label = f"prompt prefix ~{approx} tokens"
+    p_ids = tokenize(build_prefix(approx), port)
+    s_ids = tokenize(
+        "\n\nList the first twenty items above with their values, one per line:\n",
+        port,
     )
-    ask = "Which of the items you just listed has the largest value?" + BARE
+    flush(port)
+    t_ids = generate(port, p_ids + s_ids, max_new_tokens=200)["output_ids"]
+    full = p_ids + s_ids + t_ids
+    # Scoring starts inside P, so the match is capped there and lands on the
+    # snapshot P left behind rather than on anything past it.
+    start = len(p_ids) - 1
+    n = len(full) - start - 1
 
-    post("/flush_cache", {}, port=port)
-    answer = chat([{"role": "user", "content": prompt}], port, max_tokens=turn1_tokens)
+    flush(port)
+    # Populating with P alone puts a snapshot at or below len(P), which every
+    # longer request sharing P is guaranteed to reach.
+    generate(port, p_ids)
+    warm = generate(port, full, logprob_start=start)
+    if not cached(warm):
+        return report("vacuous", label, "warm arm did not hit the prefix")
+    w = input_logprobs(warm, n)
+    c0, c1 = cold_pair(port, full, start, n)
 
-    followup = [
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": answer},
-        {"role": "user", "content": ask},
-    ]
-    warm = chat(followup, port)  # prefix hit spans turn 1's generated tokens
+    noise = mean_gap(c0, c1)
+    warm_gap = mean_gap(w, c0)
+    stats = (
+        f"hit {cached(warm)} of {len(full)}, {n} scored tokens, mean |dlogprob|: "
+        f"warm {warm_gap:.4f}, cold/cold {noise:.4f}"
+    )
+    return verdict(label, warm_gap, noise, stats)
 
-    colds = []
-    for _ in range(2):
-        post("/flush_cache", {}, port=port)
-        colds.append(chat(followup, port))
 
-    label = f"multi-turn (turn 1 generated {len(answer)} chars)"
-    return verdict(label, warm, *colds)
+def check_decode_snapshot(port, generated=700, min_scored=160):
+    """Reuse a request's *generated* tokens -- the decode-side snapshot path."""
+    label = "generated prefix (decode-side snapshot)"
+    p_ids = tokenize(
+        build_prefix(1024)
+        + "\n\nWrite a long, detailed essay about the patterns in these values.\n",
+        port,
+    )
+    q_ids = tokenize("\nIn one sentence, the main pattern is", port)
+
+    # Where the decode-side snapshot lands is SGLang's choice
+    # (mamba_track_interval); ask the cache instead of assuming it, and keep at
+    # least `min_scored` generated tokens after it.
+    for attempt in range(3):
+        if attempt:
+            generated += min_scored
+        flush(port)
+        r1 = generate(
+            port, p_ids, max_new_tokens=generated, logprob_start=len(p_ids) - 1
+        )
+        out = r1["output_ids"]
+        r2 = p_ids + out + q_ids
+        hit = cached(generate(port, r2))
+        if hit > len(p_ids) and len(p_ids) + len(out) - hit >= min_scored:
+            break
+    else:
+        return report(
+            "vacuous",
+            label,
+            f"hit {hit} does not reach past the {len(p_ids)}-token prompt "
+            f"with {min_scored} generated tokens left to score",
+        )
+    decode_lp = [x[0] for x in r1["meta_info"].get("output_token_logprobs") or []]
+    if len(decode_lp) != len(out) or any(v is None for v in decode_lp):
+        return report("inconclusive", label, "server returned no decode log-probs")
+
+    # The probe above inserted r2's own snapshot past the generated tokens;
+    # capping the match just after the hit makes the warm arm resume from the
+    # decode-side snapshot again.
+    start = hit + 8
+    n = len(p_ids) + len(out) - start - 1
+    warm = generate(port, r2, logprob_start=start)
+    if cached(warm) != hit:
+        return report("vacuous", label, f"warm arm hit {cached(warm)}, expected {hit}")
+    w = input_logprobs(warm, n)
+    c0, c1 = cold_pair(port, r2, start, n)
+
+    first = start + 1 - len(p_ids)
+    kernel_gap = mean_gap(decode_lp[first : first + n], c0)
+    cold_gap = mean_gap(c0, c1)
+    warm_gap = mean_gap(w, c0)
+    stats = (
+        f"hit {hit} of {len(r2)}, {n} scored tokens, mean |dlogprob|: "
+        f"warm {warm_gap:.4f}, decode/prefill {kernel_gap:.4f}, "
+        f"cold/cold {cold_gap:.4f}"
+    )
+    return verdict(label, warm_gap, max(kernel_gap, cold_gap), stats)
 
 
 def main():
@@ -188,23 +267,23 @@ def main():
         help="approx prefix lengths; include one that is not a multiple of 64",
     )
     ap.add_argument(
-        "--multiturn",
+        "--decode-snapshot",
         action="store_true",
         help="also reuse generated tokens as a prefix (decode-side snapshot)",
     )
     args = ap.parse_args()
 
     results = [check_prompt_prefix(args.port, a) for a in args.prefix_tokens]
-    if args.multiturn:
-        results.append(check_multiturn(args.port))
+    if args.decode_snapshot:
+        results.append(check_decode_snapshot(args.port))
 
-    fails = results.count("fail")
-    unknown = results.count("inconclusive")
+    passed = results.count("pass")
     print(
-        f"\nRESULT: {results.count('pass')} pass, {fails} fail, "
-        f"{unknown} inconclusive"
+        f"\nRESULT: {passed} pass, {results.count('fail')} fail, "
+        f"{results.count('inconclusive')} inconclusive, "
+        f"{results.count('vacuous')} vacuous"
     )
-    return 1 if fails or unknown else 0
+    return 0 if passed == len(results) else 1
 
 
 if __name__ == "__main__":
