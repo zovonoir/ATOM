@@ -979,6 +979,55 @@ def test_decode_capture_preallocates_verify_width_and_full_pages(monkeypatch):
     assert _DECODE_GRAPH.max_pages == 128
 
 
+class EagleDraftInput:
+    """Stand-in carrying SGLang's draft ``spec_info`` class name."""
+
+
+@pytest.mark.parametrize("draft_graph", [False, True])
+def test_draft_decode_out_graph_hook_leaves_target_buffers(monkeypatch, draft_graph):
+    """ATOM_SGLANG_QWEN4_DRAFT_CG: the draft runner's out-of-graph hook must not
+    fill _DECODE_GRAPH, which TARGET_VERIFY replays from. Off: unchanged fill."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+    from atom.plugin.sglang.qwen4_exp_bridge import (
+        prepare_qwen4_exp_decode_graph_metadata,
+    )
+
+    monkeypatch.setenv("ATOM_SGLANG_QWEN4_DRAFT_CG", "1" if draft_graph else "0")
+    args = SimpleNamespace(
+        speculative_algorithm="EAGLE",
+        speculative_num_steps=2,
+        speculative_num_draft_tokens=3,
+        cuda_graph_max_bs_decode=8,
+        cuda_graph_max_bs=None,
+        cuda_graph_config=None,
+        max_running_requests=8,
+        context_length=8192,
+        max_model_len=8192,
+        page_size=64,
+    )
+    monkeypatch.setattr(bridge, "_server_args", lambda: args)
+    device = torch.device("cpu")
+    draft_fb = SimpleNamespace(
+        forward_mode=_DecodeMode(),
+        batch_size=1,
+        num_padding=0,
+        device=device,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        seq_lens=torch.tensor([16], dtype=torch.int32),
+        req_to_token_pool=_Pool(),
+        out_cache_loc=torch.tensor([0], dtype=torch.int64),
+        page_size=64,
+        spec_info=EagleDraftInput(),
+        positions=torch.tensor([16], dtype=torch.int64),
+        cuda_graph_max_bs_decode=8,
+    )
+    qsa = prepare_qwen4_exp_decode_graph_metadata(
+        draft_fb, in_capture=True, atom_config=_flash_atom_config()
+    )
+    assert qsa is not None
+    assert (_DECODE_GRAPH.block_tables is None) == draft_graph
+
+
 @pytest.mark.parametrize(
     "decode,running,expected",
     [
