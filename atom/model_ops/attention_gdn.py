@@ -477,7 +477,9 @@ class GatedDeltaNet(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                     # Only when there is somewhere to put them; `h` is large and is
                     # dropped on return otherwise.
-                    keep_intermediate_states=ckpt is not None,
+                    keep_intermediate_states=(
+                        ckpt is not None or gdn_metadata.keep_intermediate_states
+                    ),
                 )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
