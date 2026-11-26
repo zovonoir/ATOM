@@ -22,7 +22,10 @@ mkdir -p "$SRC"
 [ -d "$SRC/aiter" ] || git clone --branch "$BRANCH" --single-branch --recurse-submodules \
   --shallow-submodules "$GH/aiter.git" "$SRC/aiter"
 
-# aiter on this branch requires flydsl >= 0.5 (the image ships 0.4.1).
+# aiter on this branch requires flydsl >= 0.5 (the image ships 0.4.1). Uninstall first: a plain
+# upgrade leaves the 0.4.1 dist-info behind and the package metadata reports no version.
+pip uninstall -y flydsl >/dev/null 2>&1 || true
+rm -rf /opt/venv/lib/python3.12/site-packages/flydsl-0.4.1.dist-info
 pip install --no-deps "${FLYDSL_WHEEL:-flydsl==0.5.3}"
 
 # sglang's Rust multimodal extension is a build artifact, not tracked in git: keep the image's.
