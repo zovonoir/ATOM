@@ -58,9 +58,16 @@ def prepare_native_pd_buffers(runner):
         "atom.plugin.sglang.models.qwen4_exp_nextn_wrapper",
     ):
         return
-    if get_parallel().pp_size != 1 or not get_memory().disable_radix_cache:
+    # Prefill-side radix was validated on MI308X 1P1D (prefix hits of 65K
+    # tokens, GSM8K unchanged); it stays opt-in via ATOM_FLASH_PD_ALLOW_RADIX=1.
+    # Decode-side radix is unsupported with speculative decoding in SGLang.
+    allow_radix = os.environ.get("ATOM_FLASH_PD_ALLOW_RADIX") == "1"
+    if get_parallel().pp_size != 1 or not (
+        get_memory().disable_radix_cache or allow_radix
+    ):
         raise ValueError(
-            "Native ATOM Qwen4Exp PD currently requires PP=1 and --disable-radix-cache"
+            "Native ATOM Qwen4Exp PD requires PP=1 and --disable-radix-cache "
+            "(set ATOM_FLASH_PD_ALLOW_RADIX=1 to keep radix on the prefill server)"
         )
     if get_disagg().disaggregation_transfer_backend != "mooncake":
         raise ValueError("Native ATOM Qwen4Exp PD currently requires Mooncake")
